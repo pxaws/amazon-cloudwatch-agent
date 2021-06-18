@@ -49,6 +49,7 @@ type pusher struct {
 	lastValidTime       int64
 	needSort            bool
 	stop                chan struct{}
+	flushBeforeStop     chan struct{}
 	lastSentTime        time.Time
 
 	initNonBlockingChOnce sync.Once
@@ -67,6 +68,7 @@ func NewPusher(target Target, service CloudWatchLogsService, flushTimeout time.D
 		eventsCh:        make(chan logs.LogEvent, 100),
 		flushTimer:      time.NewTimer(flushTimeout),
 		stop:            make(chan struct{}),
+		flushBeforeStop: make(chan struct{}),
 		startNonBlockCh: make(chan struct{}),
 	}
 	go p.start()
@@ -120,6 +122,14 @@ func hasValidTime(e logs.LogEvent) bool {
 
 func (p *pusher) Stop() {
 	close(p.stop)
+
+	//wait for at most two flush cycles to flush metrics in queue
+	select {
+	case <-p.flushBeforeStop:
+		p.Log.Infof("Stop pusher after flushing out metrics in queue")
+	case <-time.After(2 * p.FlushTimeout):
+		p.Log.Infof("Stop pusher after 2 flush time intervals")
+	}
 }
 
 func (p *pusher) start() {
@@ -183,8 +193,12 @@ func (p *pusher) start() {
 			}
 		case <-p.stop:
 			if len(p.events) > 0 {
+				p.Log.Infof("Began to flush out %s log events before shutdown", len(p.events))
 				p.send()
+				p.Log.Infof("Finished flushing out")
 			}
+
+			close(p.flushBeforeStop)
 			return
 		}
 	}
