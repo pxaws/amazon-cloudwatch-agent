@@ -127,8 +127,8 @@ func (p *pusher) Stop() {
 	select {
 	case <-p.flushBeforeStop:
 		p.Log.Infof("Stop pusher after flushing out metrics in queue")
-	case <-time.After(2 * p.FlushTimeout):
-		p.Log.Infof("Stop pusher after 2 flush time intervals")
+	case <-time.After(p.FlushTimeout):
+		p.Log.Infof("Stop pusher after 1 flush time intervals")
 	}
 }
 
@@ -153,37 +153,7 @@ func (p *pusher) start() {
 	for {
 		select {
 		case e := <-ec:
-			// Start timer when first event of the batch is added (happens after a flush timer timeout)
-			if len(p.events) == 0 {
-				p.resetFlushTimer()
-			}
-
-			ce := p.convertEvent(e)
-			et := time.Unix(*ce.Timestamp/1000, *ce.Timestamp%1000) // Cloudwatch Log Timestamp is in Millisecond
-
-			// A batch of log events in a single request cannot span more than 24 hours.
-			if (p.minT != nil && et.Sub(*p.minT) > 24*time.Hour) || (p.maxT != nil && p.maxT.Sub(et) > 24*time.Hour) {
-				p.send()
-			}
-
-			size := len(*ce.Message) + eventHeaderSize
-			if p.bufferredSize+size > reqSizeLimit || len(p.events) == reqEventsLimit {
-				p.send()
-			}
-
-			if len(p.events) > 0 && *ce.Timestamp < *p.events[len(p.events)-1].Timestamp {
-				p.needSort = true
-			}
-
-			p.events = append(p.events, ce)
-			p.doneCallbacks = append(p.doneCallbacks, e.Done)
-			p.bufferredSize += size
-			if p.minT == nil || p.minT.After(et) {
-				p.minT = &et
-			}
-			if p.maxT == nil || p.maxT.Before(et) {
-				p.maxT = &et
-			}
+			p.addToSendQueue(e)
 
 		case <-p.flushTimer.C:
 			if time.Since(p.lastSentTime) >= p.FlushTimeout && len(p.events) > 0 {
@@ -192,8 +162,21 @@ func (p *pusher) start() {
 				p.resetFlushTimer()
 			}
 		case <-p.stop:
+			// for {
+			select {
+			case e := <-p.eventsCh:
+				p.addToSendQueue(e)
+				p.Log.Infof("fetch from blocking queue")
+			case e := <-p.nonBlockingEventsCh:
+				p.addToSendQueue(e)
+				p.Log.Infof("fetch from non-blocking queue")
+			case <-time.After(p.FlushTimeout):
+				p.Log.Infof("No log events from blocking and non-blocking queue in 1 flush cycle")
+				break
+			}
+
 			if len(p.events) > 0 {
-				p.Log.Infof("Began to flush out %s log events before shutdown", len(p.events))
+				p.Log.Infof("Began to flush out %v log events before shutdown", len(p.events))
 				p.send()
 				p.Log.Infof("Finished flushing out")
 			}
@@ -201,6 +184,40 @@ func (p *pusher) start() {
 			close(p.flushBeforeStop)
 			return
 		}
+	}
+}
+
+func (p *pusher) addToSendQueue(e logs.LogEvent) {
+	// Start timer when first event of the batch is added (happens after a flush timer timeout)
+	if len(p.events) == 0 {
+		p.resetFlushTimer()
+	}
+
+	ce := p.convertEvent(e)
+	et := time.Unix(*ce.Timestamp/1000, *ce.Timestamp%1000) // Cloudwatch Log Timestamp is in Millisecond
+
+	// A batch of log events in a single request cannot span more than 24 hours.
+	if (p.minT != nil && et.Sub(*p.minT) > 24*time.Hour) || (p.maxT != nil && p.maxT.Sub(et) > 24*time.Hour) {
+		p.send()
+	}
+
+	size := len(*ce.Message) + eventHeaderSize
+	if p.bufferredSize+size > reqSizeLimit || len(p.events) == reqEventsLimit {
+		p.send()
+	}
+
+	if len(p.events) > 0 && *ce.Timestamp < *p.events[len(p.events)-1].Timestamp {
+		p.needSort = true
+	}
+
+	p.events = append(p.events, ce)
+	p.doneCallbacks = append(p.doneCallbacks, e.Done)
+	p.bufferredSize += size
+	if p.minT == nil || p.minT.After(et) {
+		p.minT = &et
+	}
+	if p.maxT == nil || p.maxT.Before(et) {
+		p.maxT = &et
 	}
 }
 
